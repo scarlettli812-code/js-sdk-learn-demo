@@ -1,5 +1,9 @@
 export interface SchedulingDemand {
   id: string;
+  batchId: string;
+  batchName: string;
+  batchPriority: number;
+  isCriticalFirstBatch: boolean;
   product: string;
   sku: string;
   region: string;
@@ -28,6 +32,8 @@ export interface SchedulerSettings {
 export interface DailyScheduleRow {
   sequence: number;
   demandId: string;
+  batchId: string;
+  batchName: string;
   product: string;
   productionDate: number;
   weekday: string;
@@ -44,8 +50,17 @@ export interface DailyScheduleRow {
   shippingWeekEnd: number;
   stopDays: number;
   isRecovery: boolean;
+  isSkuSwitch: boolean;
+  switchReason: SwitchReason;
   explanation: string;
 }
+
+export type SwitchReason =
+  | '初始排产'
+  | '连续生产'
+  | '批次完成后重排'
+  | '关键首批触发'
+  | '关键首批完成后切回';
 
 export interface RecoveryEvent {
   product: string;
@@ -87,6 +102,15 @@ export interface SchedulingResult {
   recoveryEvents: RecoveryEvent[];
   uncoveredDemandCount: number;
   uncoveredQuantity: number;
+  roundedTargetShortfallCount: number;
+  roundedTargetShortfallQuantity: number;
+}
+
+interface BatchState {
+  demand: SchedulingDemand;
+  productionTarget: number;
+  remainingProduction: number;
+  remainingDemand: number;
 }
 
 const WEEKDAYS = ['星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六'];
@@ -153,8 +177,10 @@ function demandSort(a: SchedulingDemand, b: SchedulingDemand): number {
   return (
     startOfMonth(a.month) - startOfMonth(b.month) ||
     a.skuPriority - b.skuPriority ||
+    a.batchPriority - b.batchPriority ||
     a.regionPriority - b.regionPriority ||
     a.createdAt - b.createdAt ||
+    a.batchId.localeCompare(b.batchId, 'zh-CN') ||
     a.id.localeCompare(b.id, 'zh-CN')
   );
 }
@@ -170,7 +196,6 @@ function aggregateCapacities(capacities: DailyCapacity[]): Array<DailyCapacity &
       existing.id += `,${capacity.id}`;
       existing.totalCapacity += Math.max(0, capacity.totalCapacity);
       existing.availableCapacity += Math.max(0, capacity.availableCapacity);
-      existing.remaining += Math.max(0, capacity.availableCapacity);
     } else {
       const available = Math.max(0, capacity.availableCapacity);
       byDay.set(key, {
@@ -178,14 +203,18 @@ function aggregateCapacities(capacities: DailyCapacity[]): Array<DailyCapacity &
         date,
         totalCapacity: Math.max(0, capacity.totalCapacity),
         availableCapacity: available,
-        remaining: available,
+        remaining: 0,
       });
     }
   }
 
-  return [...byDay.values()].sort(
-    (a, b) => a.product.localeCompare(b.product, 'zh-CN') || a.date - b.date,
-  );
+  return [...byDay.values()]
+    .map((capacity) => ({
+      ...capacity,
+      // V2 only rounds real daily capacity down to whole units. It is never rounded to roundUnit.
+      remaining: Math.floor(capacity.availableCapacity + EPSILON),
+    }))
+    .sort((a, b) => a.product.localeCompare(b.product, 'zh-CN') || a.date - b.date);
 }
 
 function applyRecoveryMarkers(
@@ -249,11 +278,11 @@ function buildRegionRows(
     demandGroups.set(key, list);
   }
 
-  const rowsByDemand = new Map<string, DailyScheduleRow[]>();
+  const rowsByBatch = new Map<string, DailyScheduleRow[]>();
   for (const row of dailyRows) {
-    const list = rowsByDemand.get(row.demandId) ?? [];
+    const list = rowsByBatch.get(row.batchId) ?? [];
     list.push(row);
-    rowsByDemand.set(row.demandId, list);
+    rowsByBatch.set(row.batchId, list);
   }
 
   const result: RegionDeliveryRow[] = [];
@@ -269,7 +298,7 @@ function buildRegionRows(
   });
 
   for (const group of orderedGroups) {
-    const groupRows = group.flatMap((demand) => rowsByDemand.get(demand.id) ?? []);
+    const groupRows = group.flatMap((demand) => rowsByBatch.get(demand.batchId) ?? []);
     const totalDemand = group.reduce((sum, demand) => sum + demand.quantity, 0);
     const scheduledQuantity = groupRows.reduce((sum, row) => sum + row.allocatedQuantity, 0);
     const unscheduledQuantity = Math.max(0, totalDemand - scheduledQuantity);
@@ -371,68 +400,159 @@ export function scheduleProduction(
     capacitiesByProduct.set(capacity.product, list);
   }
 
+  const batchStates = orderedDemands
+    .filter((demand) => demand.schedulable)
+    .map<BatchState>((demand) => {
+      const productionTarget = Math.ceil((demand.quantity - EPSILON) / settings.roundUnit) * settings.roundUnit;
+      return {
+        demand,
+        productionTarget,
+        remainingProduction: productionTarget,
+        remainingDemand: demand.quantity,
+      };
+    });
+
+  const statesByProduct = new Map<string, BatchState[]>();
+  for (const state of batchStates) {
+    const list = statesByProduct.get(state.demand.product) ?? [];
+    list.push(state);
+    statesByProduct.set(state.demand.product, list);
+  }
+
   const dailyRows: DailyScheduleRow[] = [];
-  for (const demand of orderedDemands) {
-    if (!demand.schedulable) continue;
+  for (const [product, productCapacities] of capacitiesByProduct) {
+    const productStates = statesByProduct.get(product) ?? [];
+    if (productStates.length === 0) continue;
 
-    let remainingDemand = demand.quantity;
-    const productCapacities = capacitiesByProduct.get(demand.product) ?? [];
+    let current: BatchState | null = null;
+    let lastProducedSku: string | null = null;
+    let pendingReturnSku: string | null = null;
+    let hasProduced = false;
+
     for (const capacity of productCapacities) {
-      if (remainingDemand <= EPSILON) break;
-      if (capacity.date < startOfDay(demand.earliestDate)) continue;
+      while (capacity.remaining > EPSILON) {
+        const ready = productStates
+          .filter(
+            (state) =>
+              state.remainingProduction > EPSILON &&
+              startOfDay(state.demand.earliestDate) <= capacity.date,
+          )
+          .sort((a, b) => demandSort(a.demand, b.demand));
+        if (ready.length === 0) break;
 
-      const maxProduction = Math.floor((capacity.remaining + EPSILON) / settings.roundUnit) * settings.roundUnit;
-      if (maxProduction <= 0) continue;
+        let selected: BatchState;
+        let switchReason: SwitchReason;
+        const currentIsUnfinished = current !== null && current.remainingProduction > EPSILON;
 
-      const neededProduction = Math.ceil((remainingDemand - EPSILON) / settings.roundUnit) * settings.roundUnit;
-      const productionQuantity = Math.min(maxProduction, neededProduction);
-      const allocatedQuantity = Math.min(remainingDemand, productionQuantity);
-      const planSurplus = productionQuantity - allocatedQuantity;
-      const week = shippingWeek(capacity.date);
+        if (currentIsUnfinished) {
+          const criticalTrigger = current!.demand.isCriticalFirstBatch
+            ? undefined
+            : ready.find(
+                (state) =>
+                  state.demand.isCriticalFirstBatch &&
+                  state.demand.sku !== current!.demand.sku,
+              );
 
-      capacity.remaining -= productionQuantity;
-      remainingDemand -= allocatedQuantity;
+          if (criticalTrigger) {
+            pendingReturnSku = current!.demand.sku;
+            selected = criticalTrigger;
+            switchReason = '关键首批触发';
+          } else {
+            selected = current!;
+            switchReason = '连续生产';
+          }
+        } else {
+          const criticalReady = ready.filter((state) => state.demand.isCriticalFirstBatch);
+          selected = criticalReady[0] ?? ready[0];
+          if (!hasProduced) {
+            switchReason = '初始排产';
+          } else if (
+            pendingReturnSku !== null &&
+            selected.demand.sku === pendingReturnSku &&
+            selected.demand.sku !== lastProducedSku
+          ) {
+            switchReason = '关键首批完成后切回';
+            pendingReturnSku = null;
+          } else {
+            switchReason = '批次完成后重排';
+          }
+        }
 
-      dailyRows.push({
-        sequence: dailyRows.length + 1,
-        demandId: demand.id,
-        product: demand.product,
-        productionDate: capacity.date,
-        weekday: WEEKDAYS[new Date(capacity.date).getDay()],
-        dayTotalCapacity: capacity.totalCapacity,
-        sku: demand.sku,
-        skuPriority: demand.skuPriority,
-        region: demand.region,
-        regionPriority: demand.regionPriority,
-        demandMonth: startOfMonth(demand.month),
-        productionQuantity,
-        allocatedQuantity,
-        planSurplus,
-        shippingWeekStart: week.start,
-        shippingWeekEnd: week.end,
-        stopDays: 0,
-        isRecovery: false,
-        explanation:
-          `需求 ${demand.id}：分配 ${allocatedQuantity}，生产 ${productionQuantity}` +
-          (planSurplus > EPSILON ? `，计划余量 ${planSurplus}` : ''),
-      });
+        current = selected;
+        const previousSku = lastProducedSku;
+        const isSkuSwitch = previousSku !== null && previousSku !== selected.demand.sku;
+        const productionQuantity = Math.min(capacity.remaining, selected.remainingProduction);
+        if (productionQuantity <= EPSILON) break;
+
+        const allocatedQuantity = Math.min(selected.remainingDemand, productionQuantity);
+        const planSurplus = productionQuantity - allocatedQuantity;
+        const week = shippingWeek(capacity.date);
+
+        capacity.remaining = Math.max(0, capacity.remaining - productionQuantity);
+        selected.remainingProduction = Math.max(0, selected.remainingProduction - productionQuantity);
+        selected.remainingDemand = Math.max(0, selected.remainingDemand - allocatedQuantity);
+
+        const switchText = isSkuSwitch ? `；SKU ${previousSku} → ${selected.demand.sku}` : '';
+        dailyRows.push({
+          sequence: dailyRows.length + 1,
+          demandId: selected.demand.id,
+          batchId: selected.demand.batchId,
+          batchName: selected.demand.batchName,
+          product: selected.demand.product,
+          productionDate: capacity.date,
+          weekday: WEEKDAYS[new Date(capacity.date).getDay()],
+          dayTotalCapacity: capacity.totalCapacity,
+          sku: selected.demand.sku,
+          skuPriority: selected.demand.skuPriority,
+          region: selected.demand.region,
+          regionPriority: selected.demand.regionPriority,
+          demandMonth: startOfMonth(selected.demand.month),
+          productionQuantity,
+          allocatedQuantity,
+          planSurplus,
+          shippingWeekStart: week.start,
+          shippingWeekEnd: week.end,
+          stopDays: 0,
+          isRecovery: false,
+          isSkuSwitch,
+          switchReason,
+          explanation:
+            `${switchReason}${switchText}；批次 ${selected.demand.batchName}（${selected.demand.batchId}）` +
+            `：分配 ${allocatedQuantity}，生产 ${productionQuantity}` +
+            (planSurplus > EPSILON ? `，计划余量 ${planSurplus}` : ''),
+        });
+
+        lastProducedSku = selected.demand.sku;
+        hasProduced = true;
+        if (selected.remainingProduction <= EPSILON) current = null;
+      }
     }
   }
 
   const recoveryEvents = applyRecoveryMarkers(dailyRows, settings.longGapDays);
   const regionRows = buildRegionRows(orderedDemands, dailyRows, recoveryEvents);
   const uncoveredRows = regionRows.filter((row) => row.unscheduledQuantity > EPSILON);
+  const allocatedByBatch = new Map<string, number>();
+  for (const row of dailyRows) {
+    allocatedByBatch.set(row.batchId, (allocatedByBatch.get(row.batchId) ?? 0) + row.allocatedQuantity);
+  }
+  const roundedTargetShortfalls = batchStates.filter(
+    (state) => state.remainingDemand <= EPSILON && state.remainingProduction > EPSILON,
+  );
 
   return {
     dailyRows,
     regionRows,
     recoveryEvents,
     uncoveredDemandCount: orderedDemands.filter((demand) => {
-      const allocated = dailyRows
-        .filter((row) => row.demandId === demand.id)
-        .reduce((sum, row) => sum + row.allocatedQuantity, 0);
+      const allocated = allocatedByBatch.get(demand.batchId) ?? 0;
       return demand.quantity - allocated > EPSILON;
     }).length,
     uncoveredQuantity: uncoveredRows.reduce((sum, row) => sum + row.unscheduledQuantity, 0),
+    roundedTargetShortfallCount: roundedTargetShortfalls.length,
+    roundedTargetShortfallQuantity: roundedTargetShortfalls.reduce(
+      (sum, state) => sum + state.remainingProduction,
+      0,
+    ),
   };
 }
