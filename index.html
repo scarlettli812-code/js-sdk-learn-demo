@@ -9,9 +9,9 @@
   <body>
     <main class="app-shell">
       <section class="hero">
-        <span class="eyebrow">LARK BASE · MVP</span>
+        <span class="eyebrow">LARK BASE · SCHEDULER</span>
         <h1>新品排产助手</h1>
-        <p>先验证插件能否读取和写入当前多维表格，随后再接入确定性排产规则。</p>
+        <p>按确定性规则读取需求和产能，生成 by 天排产及区域交付结果。</p>
       </section>
 
       <section class="card status-card">
@@ -23,28 +23,40 @@
       </section>
 
       <section class="card">
-        <label class="label" for="tableSelect">选择测试数据表</label>
-        <select id="tableSelect" disabled>
-          <option>等待读取…</option>
-        </select>
-        <p class="hint">已读取 <span id="tableCount">0</span> 张数据表。</p>
-
-        <div class="actions">
-          <button id="refreshButton" class="button secondary" type="button">重新读取</button>
-          <button id="addRecordButton" class="button primary" type="button" disabled>写入一条空白测试记录</button>
+        <div class="section-title">
+          <div>
+            <span class="label">数据准备</span>
+            <h2><span id="tableCount">0</span> / 5 张表已识别</h2>
+          </div>
+          <button id="refreshButton" class="button ghost" type="button">重新读取</button>
+        </div>
+        <p id="readinessText" class="hint">正在核对数据表…</p>
+        <div class="stats">
+          <div class="stat">
+            <span>需求记录</span>
+            <strong id="demandCount">—</strong>
+          </div>
+          <div class="stat">
+            <span>产能记录</span>
+            <strong id="capacityCount">—</strong>
+          </div>
         </div>
       </section>
 
-      <section class="card next-card">
-        <div>
-          <span class="label">下一阶段</span>
-          <h2>接入排产逻辑</h2>
-          <p>读取需求与产能，生成 by 天排产和区域交付结果。</p>
-        </div>
-        <button class="button disabled" type="button" disabled>重新排产 · 待接入</button>
+      <section class="card schedule-card">
+        <span class="label">执行排产</span>
+        <h2>生成一个新的当前版本</h2>
+        <p>旧结果会保留为历史版本；缺少参数或产能不足时会在控制台标记“有异常”。</p>
+        <button id="scheduleButton" class="button primary full" type="button" disabled>重新排产</button>
       </section>
 
-      <p class="privacy">当前测试版不会向外部服务器发送多维表格数据。</p>
+      <section id="runPanel" class="card run-card" hidden>
+        <span class="label">本次运行</span>
+        <h2 id="runSummary">排产进行中</h2>
+        <p id="runDetails">正在准备数据…</p>
+      </section>
+
+      <p class="privacy">计算在插件中完成，不会把多维表格数据发送到外部服务器。</p>
     </main>
     <script type="module" src="/src/index.ts"></script>
   </body>
