@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
+    <title>新品排产助手</title>
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="hero">
+        <span class="eyebrow">LARK BASE · MVP</span>
+        <h1>新品排产助手</h1>
+        <p>先验证插件能否读取和写入当前多维表格，随后再接入确定性排产规则。</p>
+      </section>
+
+      <section class="card status-card">
+        <div>
+          <span class="label">连接状态</span>
+          <strong id="statusText">正在连接飞书多维表格…</strong>
+        </div>
+        <span id="statusDot" class="status-dot loading" aria-hidden="true"></span>
+      </section>
+
+      <section class="card">
+        <label class="label" for="tableSelect">选择测试数据表</label>
+        <select id="tableSelect" disabled>
+          <option>等待读取…</option>
+        </select>
+        <p class="hint">已读取 <span id="tableCount">0</span> 张数据表。</p>
+
+        <div class="actions">
+          <button id="refreshButton" class="button secondary" type="button">重新读取</button>
+          <button id="addRecordButton" class="button primary" type="button" disabled>写入一条空白测试记录</button>
+        </div>
+      </section>
+
+      <section class="card next-card">
+        <div>
+          <span class="label">下一阶段</span>
+          <h2>接入排产逻辑</h2>
+          <p>读取需求与产能，生成 by 天排产和区域交付结果。</p>
+        </div>
+        <button class="button disabled" type="button" disabled>重新排产 · 待接入</button>
+      </section>
+
+      <p class="privacy">当前测试版不会向外部服务器发送多维表格数据。</p>
+    </main>
+    <script type="module" src="/src/index.ts"></script>
+  </body>
+</html>
