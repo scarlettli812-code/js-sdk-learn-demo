@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  assertNoDailyCapacityOverrun,
   scheduleProduction,
   shippingWeek,
   startOfDay,
@@ -241,7 +242,21 @@ describe('scheduleProduction V2', () => {
 
     expect(result.dailyRows.map((row) => row.demandId)).toEqual(['D1', 'D2']);
     expect(result.dailyRows.reduce((sum, row) => sum + row.productionQuantity, 0)).toBe(20);
+    expect(result.dailyRows.map((row) => row.dayTotalCapacity)).toEqual([100, null]);
     expect(result.dailyRows[1].switchReason).toBe('批次完成后重排');
+  });
+
+  it('写入前独立校验同产品同一天不得超过可排产能', () => {
+    const date = day(2026, 8, 3);
+    const rows = [
+      { product: 'P1', productionDate: date, productionQuantity: 6 },
+      { product: 'P1', productionDate: date, productionQuantity: 5 },
+    ];
+
+    expect(() => assertNoDailyCapacityOverrun(
+      rows,
+      [capacity({ product: 'P1', date, totalCapacity: 10, availableCapacity: 10 })],
+    )).toThrow('当日超产：P1 2026-08-03 生产 11，可排产能 10，超出 1');
   });
 
   it('遵守最早可生产日，并且每天不超过可排产能', () => {

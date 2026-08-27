@@ -37,7 +37,7 @@ export interface DailyScheduleRow {
   product: string;
   productionDate: number;
   weekday: string;
-  dayTotalCapacity: number;
+  dayTotalCapacity: number | null;
   sku: string;
   skuPriority: number;
   region: string;
@@ -215,6 +215,49 @@ function aggregateCapacities(capacities: DailyCapacity[]): Array<DailyCapacity &
       remaining: Math.floor(capacity.availableCapacity + EPSILON),
     }))
     .sort((a, b) => a.product.localeCompare(b.product, 'zh-CN') || a.date - b.date);
+}
+
+type DailyProductionAllocation = Pick<
+  DailyScheduleRow,
+  'product' | 'productionDate' | 'productionQuantity'
+>;
+
+/**
+ * Final safety gate before any scheduling result is written back to Base.
+ * It deliberately recalculates daily usage independently of the allocation loop,
+ * so a future algorithm change cannot silently create an over-capacity result.
+ */
+export function assertNoDailyCapacityOverrun(
+  rows: DailyProductionAllocation[],
+  capacities: DailyCapacity[],
+): void {
+  const availableByDay = new Map<string, number>();
+  for (const capacity of aggregateCapacities(capacities)) {
+    availableByDay.set(
+      capacityKey(capacity.product, capacity.date),
+      Math.floor(capacity.availableCapacity + EPSILON),
+    );
+  }
+
+  const scheduledByDay = new Map<string, number>();
+  for (const row of rows) {
+    const date = startOfDay(row.productionDate);
+    const key = capacityKey(row.product, date);
+    const scheduled = (scheduledByDay.get(key) ?? 0) + row.productionQuantity;
+    scheduledByDay.set(key, scheduled);
+
+    const available = availableByDay.get(key);
+    if (available === undefined) {
+      throw new Error(`排产校验失败：${row.product} ${formatDate(date)} 缺少可排产能`);
+    }
+    if (scheduled > available + EPSILON) {
+      const overage = scheduled - available;
+      throw new Error(
+        `当日超产：${row.product} ${formatDate(date)} ` +
+        `生产 ${scheduled}，可排产能 ${available}，超出 ${overage}`,
+      );
+    }
+  }
 }
 
 function applyRecoveryMarkers(
@@ -430,6 +473,7 @@ export function scheduleProduction(
     let hasProduced = false;
 
     for (const capacity of productCapacities) {
+      let shouldShowDayCapacity = true;
       while (capacity.remaining > EPSILON) {
         const ready = productStates
           .filter(
@@ -501,7 +545,9 @@ export function scheduleProduction(
           product: selected.demand.product,
           productionDate: capacity.date,
           weekday: WEEKDAYS[new Date(capacity.date).getDay()],
-          dayTotalCapacity: capacity.totalCapacity,
+          // A day can contain several task rows. Show the daily capacity once only;
+          // otherwise summing this column in Base would incorrectly double count it.
+          dayTotalCapacity: shouldShowDayCapacity ? capacity.totalCapacity : null,
           sku: selected.demand.sku,
           skuPriority: selected.demand.skuPriority,
           region: selected.demand.region,
@@ -524,10 +570,13 @@ export function scheduleProduction(
 
         lastProducedSku = selected.demand.sku;
         hasProduced = true;
+        shouldShowDayCapacity = false;
         if (selected.remainingProduction <= EPSILON) current = null;
       }
     }
   }
+
+  assertNoDailyCapacityOverrun(dailyRows, capacities);
 
   const recoveryEvents = applyRecoveryMarkers(dailyRows, settings.longGapDays);
   const regionRows = buildRegionRows(orderedDemands, dailyRows, recoveryEvents);
