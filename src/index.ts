@@ -30,6 +30,7 @@ const REQUIRED_FIELDS: Record<TableName, readonly string[]> = {
   ],
   '01_需求与优先级': [
     '需求ID', '产品', '料号', '区域', '需求月份', '要货数量',
+    '交付批次', '批次优先级', '是否关键首批', '批次ID',
     '料号优先级', '区域优先级', '最早可生产日', '是否参与排产', '创建时间',
   ],
   '02_每日产能': [
@@ -38,7 +39,8 @@ const REQUIRED_FIELDS: Record<TableName, readonly string[]> = {
   '03_排产结果_by天': [
     '排产记录ID', '运行ID', '是否当前版本', '产品', '生产日期', '星期',
     '当日总产能', '料号', '料号优先级', '区域', '区域优先级', '需求月份',
-    '关联需求ID', '生产数量', '需求分配量', '可发周开始', '可发周结束',
+    '关联需求ID', '关联批次ID', '交付批次', '是否SKU切换', '切换原因',
+    '生产数量', '需求分配量', '可发周开始', '可发周结束',
     '停产天数', '是否恢复生产', '排产说明',
   ],
   '04_区域交付结果': [
@@ -266,6 +268,10 @@ function buildDailyWriteRecords(
     区域优先级: row.regionPriority,
     需求月份: row.demandMonth,
     关联需求ID: row.demandId,
+    关联批次ID: row.batchId,
+    交付批次: row.batchName,
+    是否SKU切换: row.isSkuSwitch,
+    切换原因: row.switchReason,
     生产数量: row.productionQuantity,
     需求分配量: row.allocatedQuantity,
     可发周开始: row.shippingWeekStart,
@@ -365,8 +371,18 @@ async function runScheduling(onProgress: (message: string) => void): Promise<Run
   try {
     const demandFields = fields['01_需求与优先级'];
     const demands: SchedulingDemand[] = [];
+    const batchIdCounts = new Map<string, number>();
+    for (const record of activeDemandRecords) {
+      const batchId = toText(cell(record, demandFields, '批次ID'));
+      if (batchId) batchIdCounts.set(batchId, (batchIdCounts.get(batchId) ?? 0) + 1);
+    }
+
     for (const [index, record] of activeDemandRecords.entries()) {
       const demandId = toText(cell(record, demandFields, '需求ID')) || record.recordId;
+      const batchId = toText(cell(record, demandFields, '批次ID'));
+      const batchName = toText(cell(record, demandFields, '交付批次'));
+      const batchPriority = toNumber(cell(record, demandFields, '批次优先级'));
+      const isCriticalFirstBatch = toBoolean(cell(record, demandFields, '是否关键首批'));
       const product = toText(cell(record, demandFields, '产品'));
       const sku = toText(cell(record, demandFields, '料号'));
       const region = toText(cell(record, demandFields, '区域'));
@@ -378,6 +394,12 @@ async function runScheduling(onProgress: (message: string) => void): Promise<Run
       const createdAt = toTimestamp(cell(record, demandFields, '创建时间'));
 
       const missing: string[] = [];
+      if (!batchId) missing.push('批次ID');
+      if (batchId && (batchIdCounts.get(batchId) ?? 0) > 1) missing.push('唯一批次ID（当前值重复）');
+      if (!batchName) missing.push('交付批次');
+      if (batchPriority === null || !Number.isInteger(batchPriority) || batchPriority < 1) {
+        missing.push('有效批次优先级（正整数）');
+      }
       if (!product) missing.push('产品');
       if (!sku) missing.push('料号');
       if (!region) missing.push('区域');
@@ -393,6 +415,10 @@ async function runScheduling(onProgress: (message: string) => void): Promise<Run
       if (!groupable) continue;
       demands.push({
         id: demandId,
+        batchId: batchId || `INVALID-${record.recordId}`,
+        batchName: batchName || '未命名批次',
+        batchPriority: batchPriority ?? Number.MAX_SAFE_INTEGER,
+        isCriticalFirstBatch,
         product,
         sku,
         region,
@@ -448,7 +474,7 @@ async function runScheduling(onProgress: (message: string) => void): Promise<Run
       if (!productsWithCapacity.has(product)) issues.push(`产品 ${product} 没有可用产能`);
     }
 
-    onProgress('正在按月份、料号和区域优先级分配产能…');
+    onProgress('正在按批次、SKU连续生产和关键首批规则分配产能…');
     const result = scheduleProduction(demands, capacities, { roundUnit, longGapDays });
     const regionTable = tables['04_区域交付结果'];
     const regionFields = fields['04_区域交付结果'];
@@ -485,6 +511,12 @@ async function runScheduling(onProgress: (message: string) => void): Promise<Run
 
     if (result.uncoveredQuantity > 0) {
       issues.push(`未覆盖需求 ${result.uncoveredDemandCount} 条，合计 ${result.uncoveredQuantity}`);
+    }
+    if (result.roundedTargetShortfallQuantity > 0) {
+      issues.push(
+        `需求已覆盖但取整目标未完成 ${result.roundedTargetShortfallCount} 个批次，` +
+        `合计差 ${result.roundedTargetShortfallQuantity}`,
+      );
     }
     const finalStatus: '已完成' | '有异常' = issues.length > 0 ? '有异常' : '已完成';
     const issueText = issues.length > 0 ? `；${issues.slice(0, 8).join('；')}` : '';
